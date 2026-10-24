@@ -97,6 +97,26 @@ Each finding printed by the script includes the exact HTTP evidence and a copy-p
 6. **Transport:** HSTS + CSP, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`; confirm dotfiles return 403 (V3).
 7. **CORS:** explicit origin allow-list; never reflect `Origin` with `Access-Control-Allow-Credentials: true` (fixes C10).
 
+## Run 1 results (2026-10-24, executed from the university network)
+
+| Claim | Result | Detail |
+|-------|--------|--------|
+| C10 CORS reflection | **OK — cleared** | Attacker origins not echoed |
+| C2 Unauthenticated data endpoints | **OK — cleared** (partial) | Default candidate list refused anonymous access; re-test after API is mapped |
+| C9 Dotfiles (.env/.git) | **OK — not exposed** | No 200 responses on probed sensitive files (V3 closed) |
+| C9 Security headers | **MEDIUM — confirmed** | HSTS, CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy all missing |
+| C9 Server banner | LOW | `Server: openresty` disclosed |
+| C9 TLS | OK | Handshake fine (cert sha256 f4377d68…) |
+| C3 / C4 / C8 login tests | **NOT RUN — tooling gap** | Discovery failed to extract the API base from the JS bundle (script truncated bundles at 20 KB). Fixed in v1.1 |
+
+**Action:** re-run with `hecon_auth_repro.py` v1.1. If discovery still can't find the API, open the site in a browser, log in with the DevTools **Network** tab open, copy the login request URL, and pass it explicitly:
+
+```bash
+python hecon_auth_repro.py --target https://hecon.arishuniversity.com \
+    --i-am-authorized --report-dir ./out2 -v \
+    --login-path /api/auth/login        # <- real path from DevTools
+```
+
 ## Out-of-band notes
 
 - The GitHub PAT used to create this repository was shared in chat text. **Treat it as burned: revoke/rotate it** at GitHub → Settings → Developer settings → Fine-grained tokens, then issue a new one stored only in the team's secret manager.

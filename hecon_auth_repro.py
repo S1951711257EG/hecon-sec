@@ -249,7 +249,8 @@ def polite_sleep() -> None:
 def req(method: str, url: str, session: requests.Session,
         headers: Optional[Dict[str, str]] = None,
         json_body: Any = None, data: Any = None,
-        allow_redirects: bool = True) -> Dict[str, Any]:
+        allow_redirects: bool = True,
+        max_body: int = 20000) -> Dict[str, Any]:
     """Rate-limited request returning status, headers, body, elapsed."""
     h = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if headers:
@@ -263,7 +264,7 @@ def req(method: str, url: str, session: requests.Session,
             verify=False)
         body = ""
         try:
-            body = r.text[:20000]
+            body = r.text[:max_body]
         except Exception:
             body = "<binary %d bytes>" % len(r.content or b"")
         return {
@@ -335,6 +336,19 @@ ASSET_HREF_RE = re.compile(
 API_URL_RE = re.compile(
     r"""(?:https?://[A-Za-z0-9_\.\-]+(?::\d+)?|(?:["'])/?)[A-Za-z0-9_\-]*api"""
     r"""[A-Za-z0-9_/\-\.]*""", re.I)
+FETCH_RE = re.compile(
+    r"""fetch\(\s*["'`]([^"'`\s]+)["'`]""", re.I)
+GENERIC_URL_RE = re.compile(
+    r"""https?://[A-Za-z0-9_\.\-]+(?::\d+)?(?:/[A-Za-z0-9_\-\.]*)?""", re.I)
+EXCLUDED_URL_HOSTS = (
+    "w3.org", "schema", "unpkg.com", "jsdelivr", "googleapis",
+    "gstatic", "cloudflare", "fontawesome", "jquery", "bootstrapcdn",
+    "npmjs", "github.com", "mozilla", "wikipedia", "example.com",
+    "localhost", "sentry", "youtube", "facebook", "twitter", "recaptcha",
+    "google.com", "gravatar", "openstreetmap", "leaflet", "mapbox")
+ENVVAR_RE = re.compile(
+    r"""(?:import\.meta\.env\.VITE_[A-Z0-9_]+|"""
+    r"""process\.env\.REACT_APP_[A-Z0-9_]+)""")
 ENDPOINT_RE = re.compile(
     r"""["'](/(?:[A-Za-z0-9_\-]+/)*[A-Za-z0-9_\-]*(?:auth|login|logout|"""
     r"""register|signup|signin|user|users|admin|student|course|grade|"""
@@ -373,14 +387,16 @@ DATA_ENDPOINTS = [
 
 def discover(session: requests.Session, base: str,
              report: Report, allow_register: bool = False,
-             allow_reset: bool = False) -> Dict[str, Any]:
+             allow_reset: bool = False,
+             api_base_override: Optional[str] = None,
+             login_path_override: Optional[str] = None) -> Dict[str, Any]:
     print("\n=== DISC  [C1] frontend bundle + API discovery ===")
     ctx: Dict[str, Any] = {
         "base": base, "bundles": [], "api_bases": set(),
         "endpoints": set(), "login_url": None, "register_url": None,
         "reset_url": None, "framework": "unknown",
     }
-    r = req("GET", base, session)
+    r = req("GET", base, session, max_body=600000)
     if not r["ok"] or r["status"] >= 400:
         report.add(Finding(
             "DISC", "CRITICAL", "Target unreachable",
@@ -418,9 +434,9 @@ def discover(session: requests.Session, base: str,
     if VERBOSE:
         print("  [disc] bundles: %s" % ctx["bundles"])
 
-    # fetch bundles, harvest API strings
+    # fetch bundles, harvest API strings (full-size: bundles are big)
     for burl in ctx["bundles"]:
-        rb = req("GET", burl, session)
+        rb = req("GET", burl, session, max_body=8000000)
         if not rb["ok"] or rb["status"] != 200:
             continue
         blob = rb["body"]
@@ -431,15 +447,32 @@ def discover(session: requests.Session, base: str,
             if val.startswith("http") or val.startswith("/"):
                 ctx["api_bases"].add(val.rstrip("/") if val.startswith(
                     "http") else val)
+        for m in FETCH_RE.finditer(blob):
+            val = m.group(1)
+            if val.startswith("/"):
+                ctx["endpoints"].add(val)
+            elif val.startswith("http"):
+                ctx["api_bases"].add(val)
+        for m in GENERIC_URL_RE.finditer(blob):
+            val = m.group(0)
+            if not any(x in val.lower() for x in EXCLUDED_URL_HOSTS):
+                ctx["api_bases"].add(val.rstrip("/"))
         for m in ENDPOINT_RE.finditer(blob):
             ctx["endpoints"].add(m.group(1))
         for m in AXIOS_RE.finditer(blob):
             ctx["endpoints"].add(m.group(1))
+        envs = sorted(set(m.group(0) for m in ENVVAR_RE.finditer(blob)))
+        if envs:
+            report.add(Finding(
+                "DISC", "INFO",
+                "Build-time env vars referenced in bundle (%d)" % len(envs),
+                "These client-side env references may embed the API base "
+                "or keys in the bundle.", envs[:12], "", "C1"))
 
     # manual additions: static config files commonly left in webroot
     for probe in ("/config.js", "/env.js", "/settings.js", "/js/config.js",
                   "/assets/config.js"):
-        rr = req("GET", base + probe, session)
+        rr = req("GET", base + probe, session, max_body=500000)
         if rr["ok"] and rr["status"] == 200 and "api" in rr["body"].lower():
             ctx["api_bases"].add(probe)
             for m in API_URL_RE.finditer(rr["body"]):
@@ -452,7 +485,17 @@ def discover(session: requests.Session, base: str,
                 "leaks the API base URL and sometimes secrets/API keys.",
                 [rr["body"][:500]], "curl -sk %s%s" % (base, probe), "C1"))
 
-    ctx["api_bases"] = sorted(ctx["api_bases"])[:12]
+    # relevance-sort api_bases: api/auth-named first, then same-host,
+    # then shortest; cap at 12
+    host = urlparse(base).hostname or ""
+
+    def _rank(u: str) -> Tuple[int, int]:
+        low = u.lower()
+        pri = 0 if ("api" in low or "auth" in low or "hecon" in low) \
+            else (1 if host in low else 2)
+        return (pri, len(u))
+
+    ctx["api_bases"] = sorted(ctx["api_bases"], key=_rank)[:12]
     ctx["endpoints"] = sorted(ctx["endpoints"])[:60]
     print("  [disc] framework=%s api_bases=%d endpoints=%d" % (
         ctx["framework"], len(ctx["api_bases"]), len(ctx["endpoints"])))
@@ -475,6 +518,23 @@ def discover(session: requests.Session, base: str,
                 if ep.startswith("/") and ep != ab and \
                         not ep.startswith(ab + "/"):
                     universe.add(ab + ep)
+
+    # apply manual overrides before probing
+    if api_base_override:
+        ctx["api_bases"].insert(0, api_base_override.rstrip("/"))
+        if api_base_override.startswith("http"):
+            universe.add(api_base_override.rstrip("/"))
+            for ep in list(universe):
+                if ep.startswith("/"):
+                    universe.add(api_base_override.rstrip("/") + ep)
+    if login_path_override:
+        ctx["login_url"] = urljoin(base + "/",
+                                   login_path_override.lstrip("/"))
+        report.add(Finding(
+            "DISC", "INFO",
+            "Login endpoint set via --login-path: %s" % login_path_override,
+            "Manual override; discovery probing skipped for login.",
+            [], "", "C1"))
 
     # probe login candidates. A real login endpoint usually answers POST
     # with 400/401/422 JSON validation rather than an HTML 404. Many
@@ -625,7 +685,8 @@ def discover(session: requests.Session, base: str,
             ctx["framework"], len(ctx["bundles"]),
             ctx["api_bases"] or "not found in JS",
             ctx["login_url"] or "not found"),
-        [], "", "C1"))
+        (["bundle: %s" % b for b in ctx["bundles"][:6]] if
+         not ctx["api_bases"] else []), "", "C1"))
     return ctx
 
 
@@ -1321,6 +1382,13 @@ def main() -> int:
                     help="low-privilege JWT for IDOR/forgery tests")
     ap.add_argument("--probe-user", default=None,
                     help="known-real email address for enumeration tests")
+    ap.add_argument("--api-base", default=None,
+                    help="override API base URL if auto-discovery fails "
+                         "(e.g. https://hecon.arishuniversity.com:4000/api)")
+    ap.add_argument("--login-path", default=None,
+                    help="override login endpoint path if auto-discovery "
+                         "fails (e.g. /api/auth/login) - find it in "
+                         "browser DevTools > Network tab while logging in")
     ap.add_argument("--report-dir", default=None)
     ap.add_argument("--rate", type=float, default=1.0)
     ap.add_argument("--timeout", type=int, default=15)
@@ -1355,7 +1423,7 @@ def main() -> int:
     report = Report()
 
     ctx = discover(session, base, report, args.allow_register,
-                   args.allow_reset)
+                   args.allow_reset, args.api_base, args.login_path)
     trans_tests(session, base, report)
     enum_tests(session, ctx, report, args.probe_user)
     bypass_tests(session, ctx, report, args.probe_user)

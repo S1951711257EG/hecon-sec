@@ -25,7 +25,7 @@ python hecon_auth_repro.py --target https://hecon.arishuniversity.com \
     --i-am-authorized --report-dir ./out -v
 ```
 
-Optional consent flags (state-changing tests stay off by default):
+Optional flags (state-changing tests stay off by default; overrides fix discovery):
 
 ```bash
 --allow-register   # mass-assignment test (creates sectest_repro_* account)
@@ -41,3 +41,10 @@ Optional consent flags (state-changing tests stay off by default):
 - No DoS, no data destruction, payloads < 2 KB; findings print exact `curl` repros.
 - Delete any `sectest_repro_*` accounts after testing.
 - **Rotate the GitHub token** that was used to bootstrap this repo — it was shared in chat and must be considered burned.
+
+If auto-discovery cannot find the API (check the "Discovery finished" finding):
+
+```bash
+--api-base https://host:port/api   # force the API base
+--login-path /api/auth/login       # force the login route (from DevTools > Network)
+```
