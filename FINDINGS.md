@@ -94,8 +94,20 @@ Each finding printed by the script includes the exact HTTP evidence and a copy-p
 3. **Input validation:** reject any JSON body whose `email`/`password` is not a plain string (kills NoSQL operators, C4); parameterized queries (kills SQLi).
 4. **Tokens:** strong random HMAC secret (≥ 256-bit, from env), `exp` ≤ 24 h + refresh rotation, reject `alg=none`, never log tokens; prefer `HttpOnly; Secure; SameSite=Lax` cookies over `localStorage` (fixes C6, XSS-token-theft).
 5. **Password reset:** generate reset tokens server-side (CSPRNG), return only `{"message":"if the account exists, an email was sent"}`, 15-minute expiry, single use, bind to account + invalidate on use; build links from server config, not request headers (fixes C7).
-6. **Transport:** HSTS + CSP, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`; confirm dotfiles return 403 (V3).
+6. **Transport:** HSTS + CSP, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`; confirm dotfiles return 403 (V3). For the openresty front proxy, a single include fixes both hosts:
+
+   ```nginx
+   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+   add_header Content-Security-Policy "default-src 'self'; connect-src 'self' https://api.arishuniversity.com wss://ws.arishuniversity.com; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'" always;
+   add_header X-Content-Type-Options "nosniff" always;
+   add_header X-Frame-Options "DENY" always;
+   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+   server_tokens off;
+   ```
+
+   Note: `add_header` in nginx/openresty is inherited **only if the block defines none of its own** — put these in the `server` block shared by both vhosts, and add HSTS on `api.` too (tokens cross the wire there).
 7. **CORS:** explicit origin allow-list; never reflect `Origin` with `Access-Control-Allow-Credentials: true` (fixes C10).
+8. **OTP reset flow (V6):** rate-limit `send-otp` per email (e.g. 3/hour) AND `verify-otp` per session (5 attempts → invalidate session); make OTP ≥ 6 digits with CSPRNG + 5-minute expiry; never return OTP/codes in any response.
 
 ## Run 1 results (2026-10-24, executed from the university network)
 
@@ -115,6 +127,68 @@ Each finding printed by the script includes the exact HTTP evidence and a copy-p
 python hecon_auth_repro.py --target https://hecon.arishuniversity.com \
     --i-am-authorized --report-dir ./out2 -v \
     --login-path /api/auth/login        # <- real path from DevTools
+```
+
+## Run 2 results (2026-10-24, v1.1 from the university network) + offline bundle analysis
+
+Run 2 fixed the v1.1 bundle-truncation gap (10 bundles scanned, CDN noise filtered) **but discovery still missed the login route — because the API is not on this host at all.** The bundles shipped to the reviewer's sandbox were then analyzed offline, which settled the architecture (V4–V7 below):
+
+| Claim | Result | Detail |
+|-------|--------|--------|
+| C10 CORS reflection | **OK — cleared (2nd run)** | Not echoed on SPA or API |
+| C2 Unauthenticated data endpoints | **OK — cleared (partial)** | Generic candidate list refused anonymous access; re-test now targets the real controller routes (`Users/`, `MyApplicationUser/`, `DatabaseBackups`, …) |
+| C9 Security headers | **MEDIUM — confirmed** | All 5 baseline headers missing (SPA host; API host headers unknown until v1.3 re-run) |
+| C9 Server banner | LOW | `Server: openresty` (reverse proxy in front of the stack) |
+| C3 / C4 / C8 / C5 / C6 / C7 / C11 | **NOT RUN — target gap** | Login endpoint lives on a separate origin; v1.2 discovers it automatically |
+
+### V4 — It's an Angular app with a service-worker manifest [INFO — tooling]
+`/ngsw.json` enumerates **every** bundle, including lazy chunks. The runtime config lives in a lazy chunk that is never referenced from `index.html` — that is why script-tag-based discovery kept missing it. v1.2 reads `ngsw.json` and scans up to 30 chunks.
+
+### V5 — API is a SEPARATE ORIGIN: `https://api.arishuniversity.com/api/`  [INFO — architecture]
+Extracted verbatim from the config chunk:
+
+```js
+serverUrl      : "https://api.arishuniversity.com/api/"
+uploadUrl      : "https://api.arishuniversity.com"
+n8nUrl         : "https://n8n.arishuniversity.com/"
+mediasoupWsUrl : "wss://ws.arishuniversity.com"
+```
+
+This explains Runs 1–2: `hecon.arishuniversity.com/api/*` was always going to 404. v1.2 synthesizes `https://api.<registrable-domain>/api/` (DNS-only check) and ranks it first, so the real API is probed even without bundle access.
+
+### V6 — Real auth routes (ASP.NET-style PascalCase controllers)  [INFO — attack surface]
+
+```
+POST {api}Users/login/                              system users -> {accessToken}
+POST {api}Participants/login                        participant portal
+POST {api}OccasionParticipants/unified-login        unified (participant + system)
+POST {api}Participants/register-public
+POST {api}Participants/forgot-password/send-otp     -> {resetSessionId, maskedEmail}
+POST {api}Participants/forgot-password/verify-otp   {resetSessionId, otpCode}
+POST {api}Participants/forgot-password/confirm      {resetSessionId, otpCode, newPassword}
+```
+
+Token handling: JWT stored in `localStorage["token"]` / `["participant-token"]`, sent as `Authorization: Bearer`, payload parsed **client-side only** (no verification) — standard, but it means XSS = account theft. The SPA is **multi-tenant**: requests carry an `X-Tenant-Id` header derived from the URL (use `--tenant <id>` to replicate).
+
+**Priority ATO questions for the re-run:** (1) is `verify-otp` rate-limited? (OTP brute force → reset any account); (2) does `unified-login` require a tenant header, and can tenant isolation be bypassed via `X-Tenant-Id`? (3) do all three login routes share the same rate-limit bucket?
+
+### V7 — High-value controller routes visible in the bundle  [INFO — BAC targets]
+`MyApplicationUser/` (system user search by id), `DatabaseBackups` (list + create snapshot!), `RolePermissions/catalog`, `UserPermissions/`, `teachers/`, `Tenants/`. The admin UI guards these with client-side `canActivate` + permission flags — the re-run probes them unauthenticated (module `BAC`).
+
+### SATELLITES — `n8n.arishuniversity.com` publicly referenced  [LOW — exposure]
+The app's config points at a public **n8n workflow-automation** instance and a **mediasoup WebSocket** (`wss://ws.…`). n8n has shipped serious CVEs (webhook auth bypass). v1.2's `SATEL` module fingerprints it and checks anonymous access to `/rest/settings`. Recommend: VPN/IP-allowlist, latest patched version, audit workflows holding credentials.
+
+**Run 3 command (v1.2 — no manual endpoint needed):**
+
+```bash
+python hecon_auth_repro.py --target https://hecon.arishuniversity.com \
+    --i-am-authorized --report-dir ./out3 -v
+# optional, if you know the tenant id from DevTools:
+#   --tenant ed
+# opt-ins for the flow tests:
+#   --allow-reset   (OTP-flow tests; sends OTPs to the probed address)
+#   --allow-register
+#   --token <JWT from localStorage["token"]>   (enables C6 forgery + IDOR)
 ```
 
 ## Out-of-band notes
